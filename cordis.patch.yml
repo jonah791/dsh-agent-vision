@@ -1,0 +1,4 @@
+- insert:
+    - id: agent-agent-vision
+      name: dsh-agent-vision
+      config: {}

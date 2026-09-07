@@ -1,5 +1,11 @@
 # dsh-agent-vision
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-agent-vision"><img src="https://img.shields.io/badge/version-0.1.0-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 > 多模态视觉插件（辅助通道）：VLM 读图 / 描述 / 双图对比。
 > DeepSeek Harness 自研插件 · v0.1.0
 

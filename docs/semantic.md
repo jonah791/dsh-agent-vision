@@ -129,16 +129,19 @@ mime 映射：`.png→image/png`、`.jpg/.jpeg→image/jpeg`、`.webp→image/we
 | # | 可证伪命题 | 证据（单测名/命令/日志行/HTTP） | 状态 |
 |---|-----------|------------------------------|------|
 | A1 | 工具面恰为 2 个（`vision_ask`、`vision_compare`） | 会话工具列表中检索 `vision_` 前缀命中 2 条；源码 `ctx.tools.register` 计数 = 2 | 已实测（源码计数） |
-| A2 | 单图 >20MB 必被拒 | 造 21MB PNG 调 `vision_ask`，返回 `ok:false, error:'图片超过 20MB'` | **待验收** |
-| A3 | 三级 key 解析顺序生效 | 置空 config.apiKey + 设有环境变量 → 调用成功；两者皆空且 credentialsFile 无键 → `无可用 API key` | **待验收** |
+| A2 | 单图 >20MB 必被拒 | `npm test` → `isOversize: 边界——恰好 20MB 不算超，多 1 字节算超`（纯逻辑层）；端到端仍需造 21MB PNG 真调一次 | 纯逻辑**已实测**（2026-09-14）；端到端待验收 |
+| A3 | 三级 key 解析顺序生效 | `npm test` → `resolveApiKey` 4 条用例（config > env > 凭据文件 / 三级皆空 → 空串 / 子串名不误取 / CRLF） | 已实测（2026-09-14，离线层） |
 | A4 | 不写任何文件（I1/I4） | 调用前后 `stat` 目标盘 `E:\alice\_tmp_review` 的 mtime 与文件数不变 | **待验收** |
-| A5 | 当前进程加载的是最新构建 | `lib/index.js` mtime `2026-09-01 20:10:02` < web PID 7080 启动 `2026-09-14 10:05:47` | 已实测（2026-09-14 读数） |
+| A5 | 当前进程加载的是最新构建 | `lib/index.js` mtime `2026-09-01 20:10:02` < web PID 7080 启动 `2026-09-14 10:05:47` | 已实测（2026-09-14 读数；本次补课重建后需重新部署核对） |
 | A6 | 挂载行存在且唯一 | `grep -n "dsh-agent-vision" .dsh/profiles/web/cordis.patch.yml` → 1 命中（行 227） | 已实测 |
-| A7 | 组合行 id 与插件内 `name` 一致 | patch `id: agent-agent-vision` vs `src/index.ts` `export const name = "agent-agent-vision"` | 已实测（一致） |
+| A7 | 组合行 id 与插件内 `name` 一致 | `npm test` → `入口契约`：断言 `mod.name === 'agent-agent-vision'`（与 patch `id` 逐字绑定）+ patch 侧 `id: agent-agent-vision` | 已实测（2026-09-14，双向） |
+| A8 | 失败/退化路径被机器锁住（S6 判据） | `npm test` → 20/20 pass：无扩展名 / 未知扩展名 / CRLF 凭据 / 三级 key 全空 / 非 JSON 响应 / HTTP 500 正文截断 / 缺 content / `undefined` 正文不抛 | 已实测（2026-09-14） |
+| A9 | 两个工具共用**同一份**判定（不漂移） | `npm test` → `不变量①：工具接线不得内联判定逻辑`；尸体样本 = 修前内联四段（MIME 映射 / 凭据行解析 / `JSON.parse(txt)` / `20*1024*1024`）必须全被抓出 | 已实测（2026-09-14） |
+| A10 | 响应解析无旁路 + HTTP 分支仍带 `model`（历史输出形状） | `npm test` → `不变量②`：`parseChatResponse(` 在 index.ts 出现恰 2 次 + HTTP 分支字面量 | 已实测（2026-09-14） |
 
 ## 8 · 与实现的关系
 
-- 主实现：`self-plugins/dsh-agent-vision/src/index.ts`（唯一文件，无同语义副本）。
+- 主实现：`self-plugins/dsh-agent-vision/src/index.ts`（IO 接线：读图 / 读凭据 / fetch / 工具注册）**+ `src/pure.ts`（纯判定层：`mimeOf` / `keyFromCredentials` / `resolveApiKey` / `resolveModel` / `resolveQuestion` / `buildChatBody` / `parseChatResponse` / `isOversize` / `errorMessage`）**；两者无同语义副本。产物 `lib/index.js` + `lib/pure.js`。测试：`tests/pure.test.mjs` + `tests/contract.test.mjs`（`npm test`，20 例）。
 - 未实现/未验证部分**显式标注**：
   - 无自证落盘（无侧车轨迹）→ **A2/A3/A4 只能靠真实调用取证，没有事后可查的日志**（§10 U2）。
   - `ctx.logger` 已创建但实现体内零调用 → 装载成功/失败在日志里**不可分辨**。
@@ -151,9 +154,22 @@ mime 映射：`.png→image/png`、`.jpg/.jpeg→image/jpeg`、`.webp→image/we
   - 语义**被补充**：组合挂载点（patch 行 226–227）、消费方技能（`comfyui-guidance` 行 422）、「零落盘」这一事实与其作为可维护性缺口的判定。
   - 语义**被修正**：无（此前无文档，无旧表述可推翻）。
   - 教训（同时回写技能 `semantic-doc-first`）：**「无落盘 = 无自证」本身就是一条必须写进语义文档的边界**——否则下一次排障会默认「有日志可查」。
+- **2026-09-14 · 可维护性补课（S3 有测试 / S6 失败路径）：判定逻辑收成单一真源 + 20 例回归**
+  - **抽层（行为不变的搬家）**：新增 `src/pure.ts` —— 两个工具原先**各内联一份**的判定（MIME 映射、20MB 常量、三级 key 解析、请求体拼装、响应解析）收成单一真源：`mimeOf` / `keyFromCredentials` / `resolveApiKey` / `resolveModel` / `resolveQuestion` / `buildChatBody` / `parseChatResponse` / `isOversize` / `errorMessage` + 三个默认文案常量。`index.ts` 只留 IO（`import('node:fs/promises')` / `process.env` / `fetch`）。
+  - **语义被确认**：错误文案**逐字保留**（`读文件失败: ` / `图片超过 20MB` / `无可用 API key（…三级解析均失败）` / `HTTP <status> <300 字>` / `响应无 content: ` / `请求失败: `），输出形状不变（HTTP 分支带 `model`、其余错误分支不带）。
+  - **机制变更（显式列出，对外可见结果相同）**：`parseChatResponse` 把「2xx 但正文非 JSON」从**抛出异常由外层 catch 成 `请求失败:`**改为**函数内直接返回 `请求失败: <parse 报错>`**（文案一致，只是不再靠异常传信号）。好处：该路径可离线断言（此前只能靠真网络）。
+  - **行为变更（显式列出，仅此一条）**：`resolveApiKey` 的凭据文件读取路径改为「前两级皆空时才读」——**与历史实现一致**；差异仅在实现结构（原来在读文件前先做一次 `String(config.apiKey || '')`）。读失败仍静默回落（`catch {}`），由下层「无可用 API key」兜住。**无功能改动**。
+  - **语义被补充（新不变量 ①）**：**判定逻辑单一真源**——工具接线不得内联 MIME 映射 / 凭据行解析 / `JSON.parse(txt)` / `20*1024*1024`（两份内联必然漂移）。由 `tests/contract.test.mjs` 守卫，尸体样本 = 修前那四段内联片段必须全被抓出（已实测），并反向断言检测器模式在真源上可命中（防空转）。
+  - **语义被补充（新不变量 ②）**：**入口命名契约**——`export const name = "agent-agent-vision"`（双前缀）与 profile patch 的 `- id: agent-agent-vision`（`.dsh/profiles/web/cordis.patch.yml:226`）**逐字绑定**；「顺手修正」成 `agent-vision` 会让组合行失配。已用测试断言钉住。
+  - **语义被确认（未改）**：`mimeOf` 对无扩展名/未知扩展名回落 `image/png`（`.bmp` 会被当 png 送出）；`resolveApiKey` 对纯空白 config 值判为「已配置」（未 trim）——两条都用「文档化 quirk」用例钉住现状，风险登记 §10。
+  - **教训**：同构工具函数（`vision_ask`/`vision_compare`）的**重复内联**是可测性的头号敌人——重复的那一份既不会被测到，也不会在改另一份时被想起。抽单一真源后，20 例秒级回归覆盖了原先只能靠真调网才能碰到的分支。
 
 ## 10 · 未决问题
 
 - **U1 第三级模型字面量**：`args.model || config.model || 'qwen-vl-max'` 里的 `'qwen-vl-max'` 与 §4.1 默认 `qwen3.8-flash` 冲突（仅当 config.model 被显式置空时可达）。倾向：删掉该字面量、直接依赖 schemastery 默认值。需实现者裁决。
 - **U2 可维护性缺口**：机制不自证（无 `vision-trace.jsonl`、logger 零调用），五问中「断在哪一段/耗时与预算」答不了（§5.22）。倾向：补一行落盘（吞错），但会与 I4「零落盘」冲突——**先裁决 I4 是否要让位**。
 - **U3 20MB 闸门与 base64 膨胀**：20MB 原图 → base64 后 ~27MB，是否应按**编码后**体积设闸？需实测 DashScope 上限后裁决。
+- **U4（新，2026-09-14）未知扩展名被当 png 送出**：`mimeOf('/tmp/a.bmp')` 返回 `image/png`（历史语义，已用 quirk 用例钉住）。真按 png 送出会让供应商按错误 MIME 解码。是否改为「未知扩展名 → 明确拒绝」待定调（改就是行为变更，会影响当前可用面）。
+- **U5（新，2026-09-14）纯空白 key 未 trim**：`config.apiKey = '   '` 会被判为「已配置」并跳过 env/凭据文件回落（`env` 值同理未 trim）——`Bearer    ` → 401。修法一行（各层 `String(x || '').trim()`），但属行为变更，待定调。
+- **U6（新，2026-09-14）`errorMessage(undefined)` 产出字符串 `"undefined"`**：调用方会拼成 `读文件失败: undefined`。是否改为兜底文案待定调（已用 quirk 用例钉住现状）。
+- **U7（新，2026-09-14）`logger` 仍零调用**（U2 的子项）：本次抽层未动日志面——装载成功/失败仍不可分辨；与 U2 的 I4「零落盘」裁决一并处理。

@@ -59,7 +59,14 @@ render：成功截断 2000 字符正文；失败显示 `VISION_ERROR: <error>`
 1. **I1 只读输入**：`vision_ask`/`vision_compare` 对文件系统只做读操作，绝不写任何路径（可用「调用前后目标目录 inode/mtime 不变」一次测量判真假）。
 2. **I2 尺寸闸门 fail-closed**：单图 >20MB 一定返回 `ok:false`，不发请求（`vision_ask` 按已读 buffer 长度判；`vision_compare` 先 `stat` 判）。
 3. **I3 错误即返回值不抛出**：任何失败路径都落在 `{ok:false, error}` 上，工具调用不抛异常。
-4. **I4 零落盘**：本插件不写任何侧车文件/日志文件（只有 `ctx.logger` 输出，宿主 logger 不落盘）——**这也是它的可维护性缺口**（§10 U2）。
+4. **I4 落盘面收窄（2026-09-14 批次 S4-A 修订；原表述为「零落盘」）**：本插件**不写被检视目标/工作区的任何文件**；
+   唯一的写入是**自证侧车** `<DSH_HOME>/vision-trace.jsonl`（§4.4，全部 IO 失败吞错并返回 `bool`）。
+   **修订理由（显式裁决）**：原 I4「零落盘」与可维护性纪律（AGENTS.md §5.22 规则 1：关键机制必须落盘自证）
+   **正面冲突**，而这个冲突的代价已实测——五问里「断在哪一段 / 耗时与预算 / 是否失败」三问答不了（§10 U2）。
+   裁决取向：**保留 I4 的原始意图（不碰被检视对象），放弃其字面表述（绝对零写）**——
+   侧车只写宿主自己的状态目录（`<DSH_HOME>`），与 `context-reminder-state.json` / `life-core/state.json` /
+   `plugin-boot.jsonl` 同址同约定；A4 的测量口径（**目标盘**文件数与 mtime 不变）**仍然成立**。
+   代价：`<DSH_HOME>` 不可写时轨迹静默失败——观测层零业务影响（§7 A14 有尸体测试）。
 
 ## 4 · 契约
 
@@ -94,10 +101,60 @@ mime 映射：`.png→image/png`、`.jpg/.jpeg→image/jpeg`、`.webp→image/we
 | 插件自身 | `src/index.ts:apply()` → `ctx.tools.register(defineTool({name:'vision_compare'…}))` | 同上 |
 | 依赖服务声明 | `src/index.ts:inject = ['tools']` | cordis 激活门（缺 tools 服务则插件不激活） |
 | 技能（消费方） | `alice-self-assets/skills/comfyui-guidance/SKILL.md:422`（「评估用 vision_ask（画风四维…）」） | 画风评估/批量审图 |
-| 外部端点 | `POST {baseUrl}/chat/completions`（`src/index.ts:78` / `:144`） | 每次工具调用 |
-| 凭据读取 | `fsp.readFile(config.credentialsFile)`（`src/index.ts:62` / `:127`） | 前两级 key 皆空时 |
-| 落盘产物 | **无**（无侧车文件、无缓存、无 outbox） | — |
+| 外部端点 | `POST {baseUrl}/chat/completions`（`src/index.ts:126` / `:184`） | 每次工具调用 |
+| 凭据读取 | `fsp.readFile(config.credentialsFile)`（`src/index.ts:readKey()`） | 前两级 key 皆空时 |
+| 落盘产物 | `<DSH_HOME>/vision-trace.jsonl`（自证侧车，2026-09-14 批次 S4-A 新增，见 §4.4） | 每次 `apply()` + 每次工具调用 |
 | 日志 | `ctx.logger("agent-agent-vision")`（引入但**未在实现体中调用**） | 无输出 |
+
+### 4.4 自证轨迹契约（`<DSH_HOME>/vision-trace.jsonl`）`[MUST]`
+
+**动机**：本插件有 **6 条早退分支 + 1 条成功分支**，对调用方**全部长一个样**（`VISION_ERROR: <一句文案>`），
+而 `ctx.logger` **不落盘** ⇒ 「昨晚那次是路径写错了、图太大、还是 key 过期」只能靠外部脚本反解会话事件流
+（AGENTS.md §5.22 规则 1）。本插件的 I4 因此被显式修订（§3 第 4 条）。
+
+- **落盘路径**：`<DSH_HOME>/vision-trace.jsonl`（`DSH_HOME` 环境变量优先，缺省 `<homedir>/.dsh`；
+  解析走 `src/trace.ts:resolveHome` **单一真源**）。追加式 JSONL，一行一事件。
+- **阶段枚举**（`VisionTracePhase`，闭集）：`boot`（`apply()` 进程级构建自报）
+  → `ask`（`vision_ask`）→ `compare`（`vision_compare`）。
+- **断点枚举**（`VisionStage`，闭集，**Q3 的核心**）：
+  `input`（参数非法，如空 path）→ `read`（读图失败）→ `size`（超 20MB）→ `key`（无可用 API key）
+  → `request`（HTTP 非 2xx / 网络异常 / 抛错）→ `parse`（响应体不可解析）→ `done`（走完全程）。
+- **行 schema**（字段固定，`boot` 行用中性值填充，`tail` 后可直接读列）：
+
+  | 字段 | 含义 | 回答哪一问 |
+  |------|------|-----------|
+  | `atMs` | 写入时刻（ms epoch） | 时间线 join |
+  | `phase` | `boot` / `ask` / `compare` | Q2 谁发起 |
+  | `build` | `<version>@<模块 mtime ms>` | **Q1 线上跑的是哪个构建** |
+  | `op` | `vision_ask` / `vision_compare` / `apply` | Q2 |
+  | `stage` | 断点枚举（见上） | **Q3 断在哪一段** |
+  | `model` | 实际模型名（`resolveModel(args.model, config.model)`） | **Q2 投给哪个模型** |
+  | `endpoint` | 目标**主机名**（`hostOf`，见隐私） | Q2 |
+  | `images` | 调用方给的图片路径（**过 `redactText`**） | Q4 |
+  | `imageBytes` | 输入图片总字节数（0 = 未读到） | Q4 |
+  | `questionChars` | 问题**字符数**（**只记长度不记内容**） | Q4 |
+  | `answerChars` | 回答字符数（失败为 0） | **Q4 结果质量** |
+  | `httpStatus` | HTTP 状态码（0 = 未发出请求） | Q3 |
+  | `durationMs` | 调用耗时（ms） | Q5 |
+  | `ok` | 工具返回的 `ok` | Q3 |
+  | `error?` | 工具 error 文案（**过 `redactText` + 截断 500**） | Q3 |
+
+- **隐私红线（本模块的设计重心，三条都是构造性保证而非尽力而为）**：
+  ① **绝不记录图片内容**——不记 base64、不记像素、不记字节样本，只记路径与字节数（§7 A16 断言轨迹行长度上界）；
+  ② **绝不记录凭据**——`endpoint` 只取 `new URL(baseUrl).hostname`，**按构造**排除 `user:pass@`（用户信息）
+     与 `?token=…`（查询串）；`apiKey` 无论来自 config / env / 凭据文件都不记（连长度/前缀都不记）；
+  ③ 路径与 error 落盘前一律过 `redactText`（§7 A15 隐私尸体测试端到端验证三者）。
+- **不变量**：① **`stage` 闭集**——「断在哪一段」是可聚合的枚举，不是自由文本；
+  ② **观测绝不反噬主流程**——`appendTraceEntry` 全部 IO 失败吞错并返回 `false`；
+     业务异常**原样重抛**（观测层不吞业务错，但先记一笔失败轨迹）；
+  ③ **业务返回形状逐字不变**（`stage`/`meta` 只存在于轨迹，绝不进工具返回值——output.schema 是
+     `additionalProperties: false`，混入即校验失败）。
+- **调用点清单**：`src/index.ts:110` / `:153` `visionTraced(...)`（**唯一收口**，包住两个执行体）
+  + `src/index.ts:198` boot 行。**新增工具必须经 `visionTraced()` 落笔**——绕开它 = 新的观测盲区。
+  执行体只负责在**事实发生处**写观测面 `meta`（`stage`/`imageBytes`/`httpStatus`）；合成与落盘收在
+  `src/trace.ts:composeVisionEntry`（纯函数，**实现与单测共用同一真源**——测试驱动真实合成逻辑，
+  而不是照抄一份「我以为是那样」的判定）。
+- **查询方式**：`tail -3 <DSH_HOME>/vision-trace.jsonl`（最近三次调用的五问）。
 
 ## 5 · 边界与信任
 
@@ -131,19 +188,30 @@ mime 映射：`.png→image/png`、`.jpg/.jpeg→image/jpeg`、`.webp→image/we
 | A1 | 工具面恰为 2 个（`vision_ask`、`vision_compare`） | 会话工具列表中检索 `vision_` 前缀命中 2 条；源码 `ctx.tools.register` 计数 = 2 | 已实测（源码计数） |
 | A2 | 单图 >20MB 必被拒 | `npm test` → `isOversize: 边界——恰好 20MB 不算超，多 1 字节算超`（纯逻辑层）；端到端仍需造 21MB PNG 真调一次 | 纯逻辑**已实测**（2026-09-14）；端到端待验收 |
 | A3 | 三级 key 解析顺序生效 | `npm test` → `resolveApiKey` 4 条用例（config > env > 凭据文件 / 三级皆空 → 空串 / 子串名不误取 / CRLF） | 已实测（2026-09-14，离线层） |
-| A4 | 不写任何文件（I1/I4） | 调用前后 `stat` 目标盘 `E:\alice\_tmp_review` 的 mtime 与文件数不变 | **待验收** |
+| A4 | **不写被检视目标/工作区**（I1；I4 已于 2026-09-14 收窄为「只写 `<DSH_HOME>` 侧车」，见 §3） | 调用前后 `stat` 目标盘 `E:\alice\_tmp_review` 的 mtime 与文件数不变；另：唯一的写入点由 `tests/trace.test.mjs` 钉住为 `<DSH_HOME>/vision-trace.jsonl`（落盘路径纯函数） | **待验收**（目标盘部分需真机；侧车路径已由单测钉住） |
 | A5 | 当前进程加载的是最新构建 | `lib/index.js` mtime `2026-09-01 20:10:02` < web PID 7080 启动 `2026-09-14 10:05:47` | 已实测（2026-09-14 读数；本次补课重建后需重新部署核对） |
 | A6 | 挂载行存在且唯一 | `grep -n "dsh-agent-vision" .dsh/profiles/web/cordis.patch.yml` → 1 命中（行 227） | 已实测 |
 | A7 | 组合行 id 与插件内 `name` 一致 | `npm test` → `入口契约`：断言 `mod.name === 'agent-agent-vision'`（与 patch `id` 逐字绑定）+ patch 侧 `id: agent-agent-vision` | 已实测（2026-09-14，双向） |
 | A8 | 失败/退化路径被机器锁住（S6 判据） | `npm test` → 20/20 pass：无扩展名 / 未知扩展名 / CRLF 凭据 / 三级 key 全空 / 非 JSON 响应 / HTTP 500 正文截断 / 缺 content / `undefined` 正文不抛 | 已实测（2026-09-14） |
 | A9 | 两个工具共用**同一份**判定（不漂移） | `npm test` → `不变量①：工具接线不得内联判定逻辑`；尸体样本 = 修前内联四段（MIME 映射 / 凭据行解析 / `JSON.parse(txt)` / `20*1024*1024`）必须全被抓出 | 已实测（2026-09-14） |
-| A10 | 响应解析无旁路 + HTTP 分支仍带 `model`（历史输出形状） | `npm test` → `不变量②`：`parseChatResponse(` 在 index.ts 出现恰 2 次 + HTTP 分支字面量 | 已实测（2026-09-14） |
+| A10 | 响应解析无旁路 + HTTP 分支仍带 `model`（历史输出形状） | `npm test` → `不变量②`：`parseChatResponse(` 在 index.ts 出现恰 2 次 + **两条 HTTP 分支** + **两次**带 model 的错误返回（2026-09-14 批次 S4-A 改为锚定独立事实，比原单次 `assert.match` 更强，见 §9） | 已实测（2026-09-14） |
+| A11 | 每次调用落一行自证轨迹（五问可一条命令答） | `npm test` → `tests/trace.test.mjs:离线组合` 真写出 7 行；线上：`tail -3 $DSH_HOME/vision-trace.jsonl` 可读 `build/op/stage/model/endpoint/images/imageBytes/questionChars/answerChars/httpStatus/durationMs/ok` | **待线上验收**（离线已锁；本批不部署，由派发者统一部署） |
+| A12 | **7 条分支的断点分类可判**（`stage` 闭集） | `npm test` → `composeVisionEntry`（真实合成函数）逐分支断言 + 离线组合断言 stage 序列恰为 `['input','read','size','key','request','parse','done']` | **已实测（离线）** |
+| A13 | 观测绝不反噬主流程（IO 失败不抛） | `npm test` → `尸体测试：父路径是普通文件 → 返回 false 且不抛`（`assert.doesNotThrow` + `=== false`） | **已实测** |
+| A14 | 观测层失败/异常不改变业务返回 | `composeVisionEntry` 的 `thrown` 分支：`ok=false` + `error` 前缀 `抛错: `；包装器随后**原样重抛**（业务异常不被观测层吞掉） | **已实测（离线）** |
+| A15 | **凭据不落盘**（隐私红线，端到端尸体测试） | `npm test` → `隐私尸体测试端到端`：图片路径含 `sk-live-…`、error 含 `Bearer <32位>`、`baseUrl` 含 `user:p@ssw0rd@…?api_key=hunter2secret` → 断言落盘原文 `includes(secret) === false`（逐个），且 `[redacted]` 确实出现、`endpoint === 'api.example.com'` | **已实测** |
+| A16 | **绝不记录图片内容** | `npm test` → `隐私保证：轨迹行里绝不出现图片内容`：构造一行并断言 `line.length < 600` 且不含 `base64`（图片 base64 必然远超此上界） | **已实测** |
+| A17 | 断点判定的最小真源可离线驱动 | `npm test` → 包装器是 `apply` 内闭包（依赖 cordis ctx）不可离线调用，故测试直接驱动它调用的**同一** `composeVisionEntry`——避免测试里出现第二份判定逻辑（技能 C2 判据单一真源） | **已实测** |
 
 ## 8 · 与实现的关系
 
-- 主实现：`self-plugins/dsh-agent-vision/src/index.ts`（IO 接线：读图 / 读凭据 / fetch / 工具注册）**+ `src/pure.ts`（纯判定层：`mimeOf` / `keyFromCredentials` / `resolveApiKey` / `resolveModel` / `resolveQuestion` / `buildChatBody` / `parseChatResponse` / `isOversize` / `errorMessage`）**；两者无同语义副本。产物 `lib/index.js` + `lib/pure.js`。测试：`tests/pure.test.mjs` + `tests/contract.test.mjs`（`npm test`，20 例）。
+- 主实现：`self-plugins/dsh-agent-vision/src/index.ts`（IO 接线：读图 / 读凭据 / fetch / 工具注册）**+ `src/pure.ts`（纯判定层：`mimeOf` / `keyFromCredentials` / `resolveApiKey` / `resolveModel` / `resolveQuestion` / `buildChatBody` / `parseChatResponse` / `isOversize` / `errorMessage`）+ `src/trace.ts`（自证轨迹层：`resolveHome` / `hostOf` / `redactText` / `describeImages` / `summarizeVisionResult` / **`composeVisionEntry`**（合成单一真源）+ 薄 IO，2026-09-14 批次 S4-A 新增）**；三者无同语义副本。产物 `lib/index.js` + `lib/pure.js` + `lib/trace.js`。测试：`tests/pure.test.mjs`（16）+ `tests/contract.test.mjs`（4）+ `tests/trace.test.mjs`（**21**）（`npm test`，**41 例**）。
 - 未实现/未验证部分**显式标注**：
-  - 无自证落盘（无侧车轨迹）→ **A2/A3/A4 只能靠真实调用取证，没有事后可查的日志**（§10 U2）。
+  - **自证落盘已补（2026-09-14 批次 S4-A）**：`<DSH_HOME>/vision-trace.jsonl`（§4.4），五问可一条命令答。
+    此前「无侧车 ⇒ A2/A3/A4 只能靠真实调用取证」的缺口已闭环（§10 U2）。**仍待线上验收**：
+    本批不部署（由派发者统一部署），轨迹行尚未在真实 web 进程里产出。
+  - **I4 被显式修订**（§3 第 4 条）：原「零落盘」与 §5.22 规则 1 冲突——裁决为「保留不碰被检视对象的意图，
+    放弃绝对零写的字面表述」。这是本批**唯一一处不变量级别的语义变更**，理由与代价已写在 §3。
   - `ctx.logger` 已创建但实现体内零调用 → 装载成功/失败在日志里**不可分辨**。
   - README 未记载 `baseUrl/model/maxTokens/timeoutMs/credentialsFile` 等配置字段（README 只列 `model`）——文档缺口，属 README 范畴，本文件未回改 README。
 
@@ -164,12 +232,59 @@ mime 映射：`.png→image/png`、`.jpg/.jpeg→image/jpeg`、`.webp→image/we
   - **语义被确认（未改）**：`mimeOf` 对无扩展名/未知扩展名回落 `image/png`（`.bmp` 会被当 png 送出）；`resolveApiKey` 对纯空白 config 值判为「已配置」（未 trim）——两条都用「文档化 quirk」用例钉住现状，风险登记 §10。
   - **教训**：同构工具函数（`vision_ask`/`vision_compare`）的**重复内联**是可测性的头号敌人——重复的那一份既不会被测到，也不会在改另一份时被想起。抽单一真源后，20 例秒级回归覆盖了原先只能靠真调网才能碰到的分支。
 
+- **2026-09-14 · 批次 S4-A：自证轨迹层（观测层新增；**唯一一处不变量修订 = I4**）**
+  - **语义被修订（I4，显式裁决）**：原 I4「零落盘」**与 §5.22 规则 1 正面冲突**，且冲突代价已实测——
+    五问里三问答不了（U2）。裁决为「保留原始意图（不碰被检视对象），放弃字面表述（绝对零写）」；
+    唯一写入点收窄为 `<DSH_HOME>/vision-trace.jsonl`。**A4 的测量口径（目标盘不变）仍然成立**。
+    记录取向的理由：**纪律冲突要显式裁决并留痕，不能两边都写**——否则文档自相矛盾，下一次排障时
+    会拿「I4 说零落盘」当证据去否定轨迹的存在。
+  - **语义被补充（新不变量 ③）**：**断点必须是闭集枚举而不是自由文本**。本插件有 6 条早退分支，
+    此前它们的**唯一外部表征**都是 `VISION_ERROR: <文案>`——文案会改、会被翻译、会被拼接，
+    故「断在哪一段」不能靠文案辨认，必须有 `VisionStage` 闭集（`input/read/size/key/request/parse/done`）。
+  - **语义被补充（隐私的构造性保证）**：原 §5「凭据纪律」只是一句承诺（「key 不落盘、不进日志」）。
+    本批把它升级为**构造性**的三条：① 图片只记路径与字节数（不记内容）；② `endpoint` 用
+    `URL.hostname` 取主机名——**按构造**排除 `user:pass@` 与 `?token=`（比「记完整 URL 再擦除」可靠，
+    擦除是尽力而为）；③ 路径与 error 过 `redactText`。并配端到端隐私尸体测试（A15）+ 行长度上界断言（A16）。
+  - **语义被修正（我自己的预期错 / 契约测试的字面耦合）**：`tests/contract.test.mjs:不变量②` 原先把
+    「HTTP 分支 + 返回形状」写成**一个连续字面量**（`kind === 'http') return { … }`）。观测层给该分支加
+    `{ meta.stage = 'request'; … }` 外壳后字面量失配——**守卫意图（HTTP 分支必须带 `model`）完全未变**。
+    处置：改为锚定**两个独立事实**（两条 `kind === 'http')` + 两次带 `model` 的错误返回），
+    **比原来更强**（原断言只 `match` 一次，对第二个工具是盲的），且不再绑在语法糖上。
+    **不得**为过测试而删断言或放松强度。
+  - **行为变更清单**：**无**——`git diff -U1 src/index.ts` 逐行核对：所有 `-`/`+` 配对**只是插入
+    `meta.*` 赋值**，原语句逐字未动；`stage` 只活在轨迹里，**绝不进工具返回值**
+    （output.schema 是 `additionalProperties: false`，混入即校验失败）。
+  - **教训**：**契约测试不要断言「源码的连续字面量」**——它把守卫绑在了与语义无关的语法糖上
+    （同一类问题在 §5.22 的「措辞匹配游戏」里出现过）。守卫应锚定**独立的事实**，越接近语义越耐用。
+
 ## 10 · 未决问题
 
 - **U1 第三级模型字面量**：`args.model || config.model || 'qwen-vl-max'` 里的 `'qwen-vl-max'` 与 §4.1 默认 `qwen3.8-flash` 冲突（仅当 config.model 被显式置空时可达）。倾向：删掉该字面量、直接依赖 schemastery 默认值。需实现者裁决。
-- **U2 可维护性缺口**：机制不自证（无 `vision-trace.jsonl`、logger 零调用），五问中「断在哪一段/耗时与预算」答不了（§5.22）。倾向：补一行落盘（吞错），但会与 I4「零落盘」冲突——**先裁决 I4 是否要让位**。
+- **U2 可维护性缺口（✅ 已闭环 2026-09-14 批次 S4-A）**：机制不自证（无 `vision-trace.jsonl`、logger 零调用），
+  五问中「断在哪一段/耗时与预算」答不了（§5.22）。**已按倾向实现**：`<DSH_HOME>/vision-trace.jsonl`（§4.4）。
+  **I4 的裁决结果**：收窄为「不写被检视对象，只写 `<DSH_HOME>` 侧车」（§3 第 4 条）——
+  即原 U2 悬置的「I4 是否要让位」问题**已裁决**：让位的是字面表述，不是意图。
+  **遗留**：需一次线上验收（真实 web 进程里 `tail` 出轨迹行）。
 - **U3 20MB 闸门与 base64 膨胀**：20MB 原图 → base64 后 ~27MB，是否应按**编码后**体积设闸？需实测 DashScope 上限后裁决。
 - **U4（新，2026-09-14）未知扩展名被当 png 送出**：`mimeOf('/tmp/a.bmp')` 返回 `image/png`（历史语义，已用 quirk 用例钉住）。真按 png 送出会让供应商按错误 MIME 解码。是否改为「未知扩展名 → 明确拒绝」待定调（改就是行为变更，会影响当前可用面）。
 - **U5（新，2026-09-14）纯空白 key 未 trim**：`config.apiKey = '   '` 会被判为「已配置」并跳过 env/凭据文件回落（`env` 值同理未 trim）——`Bearer    ` → 401。修法一行（各层 `String(x || '').trim()`），但属行为变更，待定调。
 - **U6（新，2026-09-14）`errorMessage(undefined)` 产出字符串 `"undefined"`**：调用方会拼成 `读文件失败: undefined`。是否改为兜底文案待定调（已用 quirk 用例钉住现状）。
-- **U7（新，2026-09-14）`logger` 仍零调用**（U2 的子项）：本次抽层未动日志面——装载成功/失败仍不可分辨；与 U2 的 I4「零落盘」裁决一并处理。
+- **U7（新，2026-09-14）`logger` 仍零调用**（U2 的子项）：本次抽层未动日志面——装载成功/失败仍不可分辨；与 U2 的 I4「零落盘」裁决一并处理。**更新（批次 S4-A）**：装载面已由 `boot` 轨迹行覆盖（构建自报），故「装载是否发生」现在可查；`ctx.logger` 仍零调用，但**不再是唯一的装载证据**。
+- **U8（新，2026-09-14 批次 S4-A）轨迹文件无轮转**：`vision-trace.jsonl` 为纯追加，无上界。
+  本插件调用频率低（辅助通道），短期无风险；长期应按 `dsh-plugin-bootreport` 的「有界裁剪（`keepLines + 50`）」
+  加上限，断言写「有界」而非「恰好等于」。需裁决是否本轮补。
+- **U9（新，2026-09-14 批次 S4-A）`questionChars` 记的是「调用方给的原始长度」**：执行体真正发出的是
+  `resolveQuestion(args.question, DEFAULT_*)` 的结果（缺省文案被补上时更长）。取舍：原始长度对
+  「模型这次问得多细」更有解释力，且**不落问题内容**（隐私）；若要精确对齐请求体长度需再取一次 `q.length`。
+  倾向：保持现状（Q4 的价值在**量级对照**，不在精确值），但登记以求裁决。
+
+## 附 · 快速取证命令
+
+```bash
+# Q1–Q5 一条命令（最近三次调用）
+tail -3 "$DSH_HOME/vision-trace.jsonl"
+# 只看失败笔次并按断点聚合（Q3：哪一段最常断）
+grep '"ok":false' "$DSH_HOME/vision-trace.jsonl" | grep -o '"stage":"[a-z]*"' | sort | uniq -c | sort -rn
+# 只看慢调用（Q5：对照 config.timeoutMs = 90000）
+grep -o '"durationMs":[0-9]*' "$DSH_HOME/vision-trace.jsonl" | awk -F: '$2 > 30000' | tail -5
+```

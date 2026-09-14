@@ -53,7 +53,17 @@ test('不变量①·尸体样本：修前的内联片段必须被检测器抓到
 test('不变量②：两个工具必须都经 parseChatResponse 解析响应（无旁路）', () => {
   const hits = indexSrc.match(/parseChatResponse\(/g) ?? []
   assert.equal(hits.length, 2, `vision_ask 与 vision_compare 各一处，实际 ${hits.length}`)
-  assert.match(indexSrc, /kind === 'http'\) return \{ ok: false, error: parsed\.error, model: modelName \}/, 'HTTP 分支必须带上 model（历史输出形状）')
+  // 2026-09-14 批次 S4-A 修正：原断言把「HTTP 分支 + 返回形状」写成一个连续字面量
+  // （`kind === 'http') return { ... }`）。观测层给该分支加了 `{ meta.stage = 'request'; … }` 外壳后，
+  // 字面量失配——但**守卫的意图（HTTP 分支必须带上 model，保住历史输出形状）完全未变**。
+  // 故改为锚定两个**独立事实**：① 两个工具各有一条 HTTP 分支；② 两个工具各返回一次带 model 的错误体。
+  // 这比原来只 assert.match 一次**更强**（原断言对第二个工具是盲的），且不再绑在语法糖上。
+  assert.equal((indexSrc.match(/kind === 'http'\)/g) ?? []).length, 2, '两个工具各需一条 HTTP 分支')
+  assert.equal(
+    (indexSrc.match(/return \{ ok: false, error: parsed\.error, model: modelName \}/g) ?? []).length,
+    2,
+    'HTTP 分支必须带上 model（历史输出形状）——两个工具都要',
+  )
 })
 
 test('入口契约：name/apply/inject + 两个工具注册名 + patch id 一致性', async () => {
